@@ -55,7 +55,7 @@ impl State {
         // The pow hash must be less or equal than the claimed target.
         // println!("self.target | {:#?}", self.target.to_le_bytes());
         let min_target = Uint256::from_le_bytes([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
         ]);
         pow <= min_target.min(self.target)
     }
