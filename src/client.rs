@@ -97,7 +97,10 @@ impl KaspadHandler {
                 (None, true, None) => error!("No block and No Error!"),
             },
             Payload::SubmitBlockResponse(res) => match res.error {
-                None => info!("Block submitted successfully!"),
+                None => {
+                    info!("Block submitted successfully!");
+                    miner.record_block_accepted();
+                }
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
             Payload::GetBlockResponse(msg) => {

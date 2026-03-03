@@ -44,6 +44,9 @@ pub struct Opt {
     #[clap(long, display_order = 10)]
     /// Output logs in alternative format (same as kaspad)
     pub altlogs: bool,
+    #[clap(long = "target-bps", display_order = 11)]
+    /// Target blocks per second for difficulty adjustment [default: 10]
+    pub target_bps: Option<f64>,
 }
 
 fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {

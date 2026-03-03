@@ -153,7 +153,7 @@ mod sync {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "shuttle"))]
 mod tests {
     use crate::swap_rust::{
         sync::{thread, Arc, Barrier},

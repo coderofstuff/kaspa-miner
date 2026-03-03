@@ -59,6 +59,12 @@ impl Uint256 {
         out.chunks_exact_mut(8).zip(self.0).for_each(|(bytes, word)| bytes.copy_from_slice(&word.to_le_bytes()));
         out
     }
+
+    #[inline(always)]
+    pub fn to_hex_trimmed(self) -> String {
+        let hex = self.to_le_bytes().iter().fold(String::new(), |acc, &c| acc + &format!("{:02x}", c));
+        hex.trim_start_matches('0').to_string()
+    }
 }
 
 impl fmt::LowerHex for Uint256 {

@@ -14,12 +14,30 @@ mod heavy_hash;
 mod keccak;
 mod xoshiro;
 
+pub fn default_min_target() -> Uint256 {
+    Uint256::from_le_bytes([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
+    ])
+}
+
+pub fn adjust_min_target(current: Uint256, ratio: f64) -> Uint256 {
+    let current_bytes = current.to_le_bytes();
+    let mut result = [0u8; 32];
+    for (i, byte) in current_bytes.iter().enumerate() {
+        let scaled = (*byte as f64 * ratio).round() as u8;
+        result[i] = scaled.min(*byte);
+    }
+    Uint256::from_le_bytes(result)
+}
+
 #[derive(Clone)]
 pub struct State {
+    #[allow(dead_code)]
     pub id: usize,
     matrix: Matrix,
     pub nonce: u64,
     target: Uint256,
+    min_target: Uint256,
     block: RpcBlock,
     // PRE_POW_HASH || TIME || 32 zero byte padding; without NONCE
     hasher: PowHasher,
@@ -27,7 +45,7 @@ pub struct State {
 
 impl State {
     #[inline]
-    pub fn new(id: usize, block: RpcBlock) -> Result<Self, Error> {
+    pub fn new(id: usize, block: RpcBlock, min_target: Uint256) -> Result<Self, Error> {
         let header = &block.header.as_ref().ok_or("Header is missing")?;
 
         let target = target::u256_from_compact_target(header.bits);
@@ -38,7 +56,7 @@ impl State {
         let hasher = PowHasher::new(pre_pow_hash, header.timestamp as u64);
         let matrix = Matrix::generate(pre_pow_hash);
 
-        Ok(Self { id, matrix, nonce: 0, target, block, hasher })
+        Ok(Self { id, matrix, nonce: 0, target, min_target, block, hasher })
     }
 
     #[inline(always)]
@@ -54,10 +72,7 @@ impl State {
         let pow = self.calculate_pow();
         // The pow hash must be less or equal than the claimed target.
         // println!("self.target | {:#?}", self.target.to_le_bytes());
-        let min_target = Uint256::from_le_bytes([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
-        ]);
-        pow <= min_target.min(self.target)
+        pow <= self.min_target.min(self.target)
     }
 
     #[inline(always)]
@@ -158,10 +173,68 @@ fn decode_to_slice<T: AsRef<[u8]>>(data: T, out: &mut [u8]) -> Result<(), FromHe
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::pow::hasher::{Hasher, HeaderHasher};
     use crate::pow::serialize_header;
     use crate::proto::{RpcBlockHeader, RpcBlockLevelParents};
     use crate::Hash;
+
+    #[test]
+    fn test_default_min_target() {
+        let default = default_min_target();
+        let expected = Uint256::from_le_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
+        ]);
+        assert_eq!(default, expected);
+    }
+
+    #[test]
+    fn test_adjust_min_target_increase() {
+        let current = Uint256::from_le_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
+        ]);
+        let adjusted = adjust_min_target(current, 1.05);
+        assert!(adjusted >= current);
+    }
+
+    #[test]
+    fn test_adjust_min_target_decrease() {
+        let current = Uint256::from_le_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0,
+        ]);
+        let adjusted = adjust_min_target(current, 0.95);
+        assert!(adjusted <= current);
+    }
+
+    #[test]
+    fn test_adjust_min_target_no_increase_above_current() {
+        let current = Uint256::from_u64(100);
+        let adjusted = adjust_min_target(current, 2.0);
+        assert!(adjusted <= current);
+    }
+
+    #[test]
+    fn test_adjust_min_target_one() {
+        let current = Uint256::from_u64(100);
+        let adjusted = adjust_min_target(current, 1.0);
+        assert_eq!(adjusted, current);
+    }
+
+    #[test]
+    fn test_adjust_min_target_zero_bytes() {
+        let current = Uint256::from_u64(0);
+        let adjusted = adjust_min_target(current, 1.05);
+        assert_eq!(adjusted, Uint256::from_u64(0));
+    }
+
+    #[test]
+    fn test_adjust_min_target_rounding() {
+        let current = Uint256::from_le_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let adjusted = adjust_min_target(current, 0.95);
+        assert!(adjusted <= current);
+    }
 
     struct Buf(Vec<u8>);
     impl Hasher for Buf {

@@ -2,6 +2,7 @@ use crate::{
     pow,
     proto::{KaspadMessage, RpcBlock},
     swap_rust::WatchSwap,
+    target::{self, Uint256},
     Error, ShutdownHandler,
 };
 use log::{info, warn};
@@ -12,7 +13,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::mpsc::Sender,
@@ -22,20 +23,32 @@ use tokio::{
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
+const LOG_RATE: Duration = Duration::from_secs(10);
+const BPS_CALCULATION_INTERVAL: Duration = Duration::from_secs(10);
+const TARGET_BPS: f64 = 20.0;
+const MIN_TARGET_ADJUSTMENT_FACTOR: f64 = 0.95;
+const MAX_TARGET_ADJUSTMENT_FACTOR: f64 = 1.05;
+
 #[allow(dead_code)]
 pub struct MinerManager {
     handles: Vec<MinerHandler>,
     block_channel: WatchSwap<pow::State>,
     send_channel: Sender<KaspadMessage>,
     logger_handle: JoinHandle<()>,
+    difficulty_handle: JoinHandle<()>,
     is_synced: bool,
     hashes_tried: Arc<AtomicU64>,
     current_state_id: AtomicUsize,
+    min_target: Arc<std::sync::Mutex<Uint256>>,
+    actual_target: Arc<std::sync::Mutex<Uint256>>,
+    blocks_accepted: Arc<AtomicU64>,
+    target_bps: f64,
 }
 
 impl Drop for MinerManager {
     fn drop(&mut self) {
         self.logger_handle.abort();
+        self.difficulty_handle.abort();
     }
 }
 
@@ -45,16 +58,22 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
     })
 }
 
-const LOG_RATE: Duration = Duration::from_secs(10);
-
 impl MinerManager {
     pub fn new(
         send_channel: Sender<KaspadMessage>,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
         shutdown: ShutdownHandler,
+        target_bps: Option<f64>,
     ) -> Self {
         let hashes_tried = Arc::new(AtomicU64::new(0));
+        let blocks_accepted = Arc::new(AtomicU64::new(0));
+        let min_target = Arc::new(std::sync::Mutex::new(pow::default_min_target()));
+        let actual_target = Arc::new(std::sync::Mutex::new(pow::default_min_target()));
+        let min_target_clone = Arc::clone(&min_target);
+        let actual_target_clone = Arc::clone(&actual_target);
+        let target_bps = target_bps.unwrap_or(TARGET_BPS);
+
         let watch = WatchSwap::empty();
         let handles = Self::launch_cpu_threads(
             send_channel.clone(),
@@ -63,17 +82,30 @@ impl MinerManager {
             shutdown,
             n_cpus,
             throttle,
+            min_target_clone,
         )
         .collect();
+
+        let difficulty_handle = task::spawn(Self::adjust_difficulty(
+            min_target.clone(),
+            actual_target_clone,
+            blocks_accepted.clone(),
+            target_bps,
+        ));
 
         Self {
             handles,
             block_channel: watch,
             send_channel,
             logger_handle: task::spawn(Self::log_hashrate(Arc::clone(&hashes_tried))),
+            difficulty_handle,
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
+            min_target,
+            actual_target,
+            blocks_accepted,
+            target_bps,
         }
     }
 
@@ -84,6 +116,7 @@ impl MinerManager {
         shutdown: ShutdownHandler,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
+        min_target: Arc<std::sync::Mutex<Uint256>>,
     ) -> impl Iterator<Item = MinerHandler> {
         let n_cpus = get_num_cpus(n_cpus);
         info!("Launching: {} cpu miners", n_cpus);
@@ -94,16 +127,25 @@ impl MinerManager {
                 hashes_tried.clone(),
                 throttle,
                 shutdown.clone(),
+                min_target.clone(),
             )
         })
     }
 
     pub fn process_block(&mut self, block: Option<RpcBlock>) -> Result<(), Error> {
+        let min_target = *self.min_target.lock().unwrap();
         let state = if let Some(b) = block {
             self.is_synced = true;
             // Relaxed ordering here means there's no promise that the counter will always go up, but the id will always be unique
             let id = self.current_state_id.fetch_add(1, Ordering::Relaxed);
-            Some(pow::State::new(id, b)?)
+
+            // Store the actual target from the node
+            if let Some(header) = &b.header {
+                let actual = target::u256_from_compact_target(header.bits);
+                *self.actual_target.lock().unwrap() = actual;
+            }
+
+            Some(pow::State::new(id, b, min_target)?)
         } else {
             if !self.is_synced {
                 return Ok(());
@@ -123,6 +165,7 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         throttle: Option<Duration>,
         shutdown: ShutdownHandler,
+        _min_target: Arc<std::sync::Mutex<Uint256>>,
     ) -> MinerHandler {
         // We mark it cold as the function is not called often, and it's not in the hot path
         #[cold]
@@ -185,6 +228,52 @@ impl MinerManager {
         }
     }
 
+    async fn adjust_difficulty(
+        min_target: Arc<std::sync::Mutex<Uint256>>,
+        actual_target: Arc<std::sync::Mutex<Uint256>>,
+        blocks_accepted: Arc<AtomicU64>,
+        target_bps: f64,
+    ) {
+        let mut ticker = tokio::time::interval(BPS_CALCULATION_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_time = Instant::now();
+
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_time).as_secs_f64();
+            last_time = now;
+
+            let blocks = blocks_accepted.swap(0, Ordering::Relaxed);
+            let bps = blocks as f64 / elapsed;
+
+            let current_min = *min_target.lock().unwrap();
+            let current_actual = *actual_target.lock().unwrap();
+            info!(
+                "Min difficulty: {}, Actual difficulty: {}",
+                current_min.to_hex_trimmed(),
+                current_actual.to_hex_trimmed()
+            );
+
+            if bps > 0.0 {
+                let ratio = target_bps / bps;
+                let mut current_min = min_target.lock().unwrap();
+                let new_min = pow::adjust_min_target(
+                    *current_min,
+                    ratio.clamp(MIN_TARGET_ADJUSTMENT_FACTOR, MAX_TARGET_ADJUSTMENT_FACTOR),
+                );
+                if new_min != *current_min {
+                    info!("Blocks/sec: {:.2}, target: {:.2}, adjusting min_target", bps, target_bps);
+                    *current_min = new_min;
+                }
+            }
+        }
+    }
+
+    pub fn record_block_accepted(&self) {
+        self.blocks_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     fn hash_suffix(n: f64) -> (f64, &'static str) {
         match n {
@@ -209,6 +298,7 @@ mod benches {
 
     #[bench]
     pub fn bench_mining(bh: &mut Bencher) {
+        let min_target = pow::default_min_target();
         let mut state = State::new(
             1,
             RpcBlock {
@@ -230,6 +320,7 @@ mod benches {
                 transactions: vec![],
                 verbose_data: None,
             },
+            min_target,
         )
         .unwrap();
         state.nonce = thread_rng().next_u64();
